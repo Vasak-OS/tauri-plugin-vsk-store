@@ -125,9 +125,318 @@ pub fn facts_of(pid: u32) -> ProcessFacts {
 /// Contra qué se compara: el sincronizador instalado, y los espacios de
 /// nombres de esta aplicación. `None` si el sincronizador no está instalado.
 pub fn expected() -> Option<Expected> {
+    expected_at(Path::new(INSTALLED_EXECUTABLE))
+}
+
+/// Lo mismo que [`expected`], con el sincronizador en otra ruta. Para pruebas:
+/// en la máquina que las corre puede estar instalado o no.
+pub fn expected_at(executable: &Path) -> Option<Expected> {
     Some(Expected {
-        executable: file_id(Path::new(INSTALLED_EXECUTABLE))?,
+        executable: file_id(executable)?,
         mount_ns: file_id(Path::new("/proc/self/ns/mnt"))?,
         user_ns: file_id(Path::new("/proc/self/ns/user"))?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXE: FileId = (1, 100);
+    const MNT: FileId = (2, 200);
+    const USER: FileId = (3, 300);
+
+    fn expected_ids() -> Expected {
+        Expected {
+            executable: EXE,
+            mount_ns: MNT,
+            user_ns: USER,
+        }
+    }
+
+    fn genuine() -> ProcessFacts {
+        ProcessFacts {
+            executable: Some(EXE),
+            mount_ns: Some(MNT),
+            user_ns: Some(USER),
+            environment: vec!["HOME".into(), "PATH".into(), "XDG_RUNTIME_DIR".into()],
+        }
+    }
+
+    #[test]
+    fn el_sincronizador_de_verdad_se_acepta() {
+        assert_eq!(judge(&genuine(), &expected_ids()), Ok(()));
+    }
+
+    #[test]
+    fn sin_poder_leer_el_ejecutable_no_se_acepta() {
+        let facts = ProcessFacts {
+            executable: None,
+            ..genuine()
+        };
+        assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
+    }
+
+    #[test]
+    fn sin_poder_leer_un_espacio_de_nombres_no_se_acepta() {
+        let sin_montaje = ProcessFacts {
+            mount_ns: None,
+            ..genuine()
+        };
+        let sin_usuario = ProcessFacts {
+            user_ns: None,
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&sin_montaje, &expected_ids()),
+            Err(Rejection::Unreadable)
+        );
+        assert_eq!(
+            judge(&sin_usuario, &expected_ids()),
+            Err(Rejection::Unreadable)
+        );
+    }
+
+    #[test]
+    fn otro_archivo_no_se_acepta_aunque_coincida_el_inodo_o_el_dispositivo() {
+        let otro_dispositivo = ProcessFacts {
+            executable: Some((9, EXE.1)),
+            ..genuine()
+        };
+        let otro_inodo = ProcessFacts {
+            executable: Some((EXE.0, 9)),
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&otro_dispositivo, &expected_ids()),
+            Err(Rejection::OtherExecutable)
+        );
+        assert_eq!(
+            judge(&otro_inodo, &expected_ids()),
+            Err(Rejection::OtherExecutable)
+        );
+    }
+
+    #[test]
+    fn otro_espacio_de_montaje_no_se_acepta() {
+        let facts = ProcessFacts {
+            mount_ns: Some((2, 999)),
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&facts, &expected_ids()),
+            Err(Rejection::OtherNamespace)
+        );
+    }
+
+    #[test]
+    fn otro_espacio_de_usuario_no_se_acepta() {
+        let facts = ProcessFacts {
+            user_ns: Some((3, 999)),
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&facts, &expected_ids()),
+            Err(Rejection::OtherNamespace)
+        );
+    }
+
+    #[test]
+    fn cualquier_variable_del_cargador_no_se_acepta() {
+        for name in ["LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_"] {
+            let mut facts = genuine();
+            facts.environment.push(name.into());
+            assert_eq!(
+                judge(&facts, &expected_ids()),
+                Err(Rejection::LoaderVariables),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn una_variable_que_solo_contiene_ld_no_es_del_cargador() {
+        let mut facts = genuine();
+        facts.environment.push("OLD_PWD".into());
+        facts.environment.push("ld_preload".into());
+        assert_eq!(judge(&facts, &expected_ids()), Ok(()));
+    }
+
+    #[test]
+    fn lo_ilegible_se_dice_antes_que_lo_distinto() {
+        // Un proceso que ya no está no tiene «otro ejecutable»: no se sabe.
+        let facts = ProcessFacts {
+            executable: Some((9, 9)),
+            mount_ns: None,
+            user_ns: Some((9, 9)),
+            environment: vec!["LD_PRELOAD".into()],
+        };
+        assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
+    }
+
+    #[test]
+    fn el_ejecutable_se_dice_antes_que_el_espacio_y_el_entorno() {
+        let facts = ProcessFacts {
+            executable: Some((9, 9)),
+            mount_ns: Some((9, 9)),
+            user_ns: Some((9, 9)),
+            environment: vec!["LD_PRELOAD".into()],
+        };
+        assert_eq!(
+            judge(&facts, &expected_ids()),
+            Err(Rejection::OtherExecutable)
+        );
+    }
+
+    #[test]
+    fn el_espacio_se_dice_antes_que_el_entorno() {
+        let facts = ProcessFacts {
+            mount_ns: Some((9, 9)),
+            environment: vec!["LD_PRELOAD".into()],
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&facts, &expected_ids()),
+            Err(Rejection::OtherNamespace)
+        );
+    }
+
+    #[test]
+    fn el_entorno_se_corta_en_los_nul() {
+        assert_eq!(
+            environment_names(b"HOME=/home/pato\0PATH=/usr/bin\0LD_PRELOAD=/tmp/x.so\0"),
+            vec!["HOME", "PATH", "LD_PRELOAD"]
+        );
+    }
+
+    #[test]
+    fn el_entorno_sin_nul_final_no_pierde_la_ultima_variable() {
+        assert_eq!(environment_names(b"A=1\0LD_AUDIT=x"), vec!["A", "LD_AUDIT"]);
+    }
+
+    #[test]
+    fn las_entradas_vacias_del_entorno_no_cuentan() {
+        assert_eq!(environment_names(b"\0\0A=1\0\0B=2\0\0"), vec!["A", "B"]);
+        assert!(environment_names(b"").is_empty());
+        assert!(environment_names(b"\0").is_empty());
+    }
+
+    #[test]
+    fn una_entrada_sin_igual_es_toda_su_nombre() {
+        assert_eq!(
+            environment_names(b"LD_PRELOAD\0B=\0"),
+            vec!["LD_PRELOAD", "B"]
+        );
+    }
+
+    #[test]
+    fn el_nombre_termina_en_el_primer_igual() {
+        assert_eq!(environment_names(b"A=b=c\0=sin_nombre\0"), vec!["A", ""]);
+    }
+
+    #[test]
+    fn un_nombre_que_no_es_utf8_se_lee_igual_y_no_esconde_al_cargador() {
+        let names = environment_names(b"\xffX=1\0LD_\xfePRELOAD=/tmp/x.so\0");
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0], "\u{fffd}X");
+        assert!(names[1].starts_with("LD_"));
+        let facts = ProcessFacts {
+            environment: names,
+            ..genuine()
+        };
+        assert_eq!(
+            judge(&facts, &expected_ids()),
+            Err(Rejection::LoaderVariables)
+        );
+    }
+
+    fn id_of(path: &str) -> FileId {
+        let m = std::fs::metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn lo_que_se_lee_de_este_proceso_coincide_con_lo_que_es() {
+        let facts = facts_of(std::process::id());
+        let exe = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(facts.executable, Some((exe.dev(), exe.ino())));
+        assert_eq!(facts.mount_ns, Some(id_of("/proc/self/ns/mnt")));
+        assert_eq!(facts.user_ns, Some(id_of("/proc/self/ns/user")));
+        // `/proc/<pid>/environ` es el entorno con el que arrancó; nadie lo toca
+        // en este binario de pruebas.
+        let mut expected_names: Vec<String> = std::env::vars_os()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        let mut names = facts.environment.clone();
+        expected_names.sort();
+        names.sort();
+        // Sin volcar la lista: si algún día se colaran los valores, un fallo
+        // los imprimiría en el registro del CI.
+        assert!(
+            names == expected_names,
+            "los nombres leídos de /proc no son los del entorno ({} contra {})",
+            names.len(),
+            expected_names.len()
+        );
+    }
+
+    #[test]
+    fn un_proceso_que_no_existe_no_se_puede_leer() {
+        // El pid 0 no tiene entrada en `/proc`.
+        let facts = facts_of(0);
+        assert_eq!(
+            facts,
+            ProcessFacts {
+                executable: None,
+                mount_ns: None,
+                user_ns: None,
+                environment: vec![],
+            }
+        );
+        assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
+    }
+
+    #[test]
+    fn este_proceso_contra_su_propio_ejecutable_solo_puede_caer_por_el_cargador() {
+        let exe = std::env::current_exe().unwrap();
+        let expected = expected_at(&exe).expect("el ejecutable de las pruebas existe");
+        let facts = facts_of(std::process::id());
+        let loader = facts.environment.iter().any(|n| n.starts_with("LD_"));
+        let verdict = judge(&facts, &expected);
+        if loader {
+            assert_eq!(verdict, Err(Rejection::LoaderVariables));
+        } else {
+            assert_eq!(verdict, Ok(()));
+        }
+    }
+
+    #[test]
+    fn lo_esperado_lleva_el_archivo_instalado_y_los_espacios_de_esta_aplicacion() {
+        let exe = std::env::current_exe().unwrap();
+        let expected = expected_at(&exe).unwrap();
+        let m = std::fs::metadata(&exe).unwrap();
+        assert_eq!(
+            expected,
+            Expected {
+                executable: (m.dev(), m.ino()),
+                mount_ns: id_of("/proc/self/ns/mnt"),
+                user_ns: id_of("/proc/self/ns/user"),
+            }
+        );
+    }
+
+    #[test]
+    fn sin_el_sincronizador_instalado_no_hay_contra_que_comparar() {
+        assert_eq!(
+            expected_at(Path::new("/nonexistent/vasak-accounts-sync")),
+            None
+        );
+    }
+
+    #[test]
+    fn lo_esperado_de_verdad_sale_de_la_ruta_instalada() {
+        let installed = Path::new(INSTALLED_EXECUTABLE);
+        assert_eq!(expected(), expected_at(installed));
+        assert_eq!(expected().is_some(), installed.exists());
+    }
 }

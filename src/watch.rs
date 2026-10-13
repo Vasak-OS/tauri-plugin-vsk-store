@@ -190,3 +190,76 @@ pub fn watch<R: Runtime>(app: AppHandle<R>, watched: Vec<&'static str>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WATCHED: &[&str] = &["calendar", "contacts"];
+
+    fn changed(area: &str) -> Notice {
+        Notice::Changed(area.into())
+    }
+
+    #[test]
+    fn una_rafaga_junta_las_areas_sin_repetir_en_el_orden_en_que_llegaron() {
+        let mut burst = Burst::default();
+        for notice in [
+            changed("contacts"),
+            changed("calendar"),
+            changed("contacts"),
+            changed("calendar"),
+        ] {
+            burst.add(notice, WATCHED);
+        }
+        assert_eq!(burst.changed, vec!["contacts", "calendar"]);
+        assert!(!burst.status);
+    }
+
+    #[test]
+    fn un_area_que_no_se_escucha_no_cuenta() {
+        let mut burst = Burst::default();
+        burst.add(changed("email"), WATCHED);
+        burst.add(changed("passwords"), WATCHED);
+        assert_eq!(burst, Burst::default());
+    }
+
+    #[test]
+    fn un_cambio_de_estado_se_anota_aparte() {
+        let mut burst = Burst::default();
+        burst.add(Notice::Status, WATCHED);
+        burst.add(changed("calendar"), WATCHED);
+        burst.add(Notice::Status, WATCHED);
+        assert_eq!(
+            burst,
+            Burst {
+                changed: vec!["calendar".into()],
+                status: true,
+            }
+        );
+    }
+
+    #[test]
+    fn el_cambio_de_dueno_no_entra_en_la_rafaga() {
+        let mut burst = Burst::default();
+        burst.add(Notice::OwnerChanged, WATCHED);
+        assert_eq!(burst, Burst::default());
+    }
+
+    #[test]
+    fn el_aviso_de_cambio_llega_a_la_ventana_con_sus_areas() {
+        assert_eq!(
+            serde_json::to_value(Changed {
+                areas: vec!["calendar".into()],
+            })
+            .unwrap(),
+            serde_json::json!({ "areas": ["calendar"] })
+        );
+    }
+
+    #[test]
+    fn los_nombres_de_los_eventos_son_los_del_paquete_de_la_ventana() {
+        assert_eq!(CHANGED_EVENT, "vsk-store://changed");
+        assert_eq!(STATUS_EVENT, "vsk-store://status");
+    }
+}

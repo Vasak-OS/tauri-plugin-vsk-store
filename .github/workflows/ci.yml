@@ -29,8 +29,12 @@ jobs:
       # `.pc` que falta: los `build.rs` de los crates `-sys` llaman a
       # `process::exit(1)`, así que se lee como un crate que no compila, a mitad
       # del grafo y muy lejos de la causa.
+      #
+      # `dbus-daemon` no es del grafo sino de las pruebas: `tests/bus.rs`
+      # levanta un bus privado por prueba para probar el cliente y la escucha
+      # contra un bus de verdad.
       pruebas_rust: -p tauri-plugin-vsk-store
-      paquetes_rust: libwebkit2gtk-4.1-dev build-essential
+      paquetes_rust: libwebkit2gtk-4.1-dev build-essential dbus-daemon
     # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit`
     # le daría también el de crates.io y el de npm a un trabajo que
     # instala dependencias de terceros.

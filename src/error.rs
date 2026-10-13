@@ -59,3 +59,82 @@ impl Serialize for Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(name: &str) -> Error {
+        Error::Store {
+            name: Some(name.into()),
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn sin_sincronizador_o_con_un_impostor_el_motivo_es_no_disponible() {
+        assert_eq!(Error::NotRunning.reason(), "unavailable");
+        assert_eq!(Error::Impostor.reason(), "unavailable");
+    }
+
+    #[test]
+    fn el_motivo_de_un_error_del_almacen_sale_de_su_nombre() {
+        assert_eq!(
+            store("org.freedesktop.DBus.Error.AccessDenied").reason(),
+            "denied"
+        );
+        assert_eq!(
+            store("org.freedesktop.DBus.Error.LimitsExceeded").reason(),
+            "too_soon"
+        );
+        assert_eq!(
+            store("org.freedesktop.DBus.Error.ServiceUnknown").reason(),
+            "unavailable"
+        );
+        assert_eq!(
+            store("org.freedesktop.DBus.Error.Failed").reason(),
+            "failed"
+        );
+        let sin_nombre = Error::Store {
+            name: None,
+            message: "x".into(),
+        };
+        assert_eq!(sin_nombre.reason(), "failed");
+    }
+
+    #[test]
+    fn una_respuesta_rara_o_un_pedido_invalido_son_un_fallo() {
+        assert_eq!(Error::Reply("x".into()).reason(), "failed");
+        assert_eq!(Error::Invalid("x".into()).reason(), "failed");
+    }
+
+    #[test]
+    fn solo_el_permiso_negado_es_negado() {
+        assert!(store("org.freedesktop.DBus.Error.AccessDenied").is_denied());
+        for error in [
+            store("org.freedesktop.DBus.Error.LimitsExceeded"),
+            store("org.freedesktop.DBus.Error.Failed"),
+            Error::NotRunning,
+            Error::Impostor,
+            Error::Reply("x".into()),
+            Error::Invalid("x".into()),
+        ] {
+            assert!(!error.is_denied(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn un_error_fdo_conserva_su_nombre_al_pasar_al_del_plugin() {
+        let error: Error =
+            zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied("no".into()))).into();
+        assert!(error.is_denied());
+    }
+
+    #[test]
+    fn a_la_ventana_el_error_le_llega_como_texto() {
+        assert_eq!(
+            serde_json::to_value(Error::Impostor).unwrap(),
+            serde_json::json!("el nombre del servicio de sincronización lo tiene otro programa")
+        );
+    }
+}

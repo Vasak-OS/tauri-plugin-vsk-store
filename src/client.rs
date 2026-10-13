@@ -257,3 +257,97 @@ fn owner_gone(error: &Error) -> bool {
                 || name == "org.freedesktop.DBus.Error.NameHasNoOwner"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn las_cuentas_repetidas_se_piden_una_vez_en_el_orden_en_que_llegaron() {
+        let pedido = ids(&["b", "a", "b", "c", "a"]);
+        assert_eq!(distinct_accounts(&pedido), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn un_pedido_vacio_no_pide_nada() {
+        assert!(distinct_accounts(&[]).is_empty());
+    }
+
+    #[test]
+    fn un_pedido_con_demasiadas_cuentas_se_corta_en_el_tope() {
+        let pedido: Vec<String> = (0..MAX_ACCOUNTS + 10).map(|i| format!("c{i}")).collect();
+        let distintas = distinct_accounts(&pedido);
+        assert_eq!(distintas.len(), MAX_ACCOUNTS);
+        assert_eq!(distintas.first(), Some(&"c0"));
+        assert_eq!(distintas.last(), Some(&"c63"));
+    }
+
+    #[test]
+    fn el_tope_cuenta_cuentas_distintas_y_no_entradas() {
+        // Cada cuenta repetida tres veces: 64 distintas en 192 entradas.
+        let pedido: Vec<String> = (0..MAX_ACCOUNTS)
+            .flat_map(|i| std::iter::repeat(format!("c{i}")).take(3))
+            .collect();
+        assert_eq!(distinct_accounts(&pedido).len(), MAX_ACCOUNTS);
+    }
+
+    #[test]
+    fn justo_en_el_tope_no_se_pierde_ninguna() {
+        let pedido: Vec<String> = (0..MAX_ACCOUNTS).map(|i| format!("c{i}")).collect();
+        assert_eq!(distinct_accounts(&pedido).len(), MAX_ACCOUNTS);
+    }
+
+    fn store_error(name: Option<&str>) -> Error {
+        Error::Store {
+            name: name.map(str::to_string),
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn el_dueno_se_fue_cuando_su_nombre_unico_ya_no_esta() {
+        assert!(owner_gone(&store_error(Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ))));
+        assert!(owner_gone(&store_error(Some(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ))));
+    }
+
+    #[test]
+    fn otros_errores_no_son_un_dueno_que_se_fue() {
+        for error in [
+            store_error(Some("org.freedesktop.DBus.Error.AccessDenied")),
+            store_error(Some("org.freedesktop.DBus.Error.UnknownMethod")),
+            store_error(Some("org.freedesktop.DBus.Error.Failed")),
+            store_error(None),
+            Error::NotRunning,
+            Error::Impostor,
+            Error::Reply("x".into()),
+            Error::Invalid("x".into()),
+        ] {
+            assert!(!owner_gone(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn la_comprobacion_de_verdad_no_acepta_a_cualquier_proceso() {
+        // Este binario de pruebas no es `/usr/bin/vasak-accounts-sync`, esté
+        // instalado o no.
+        assert!(!InstalledExecutable.trusted(std::process::id()));
+        assert!(!InstalledExecutable.trusted(0));
+    }
+
+    #[test]
+    fn las_areas_de_la_aplicacion_son_las_que_registro() {
+        assert_eq!(
+            StoreClient::for_areas(vec!["calendar"]).watched(),
+            ["calendar"]
+        );
+        assert_eq!(StoreClient::new().watched(), status::AREAS);
+    }
+}
