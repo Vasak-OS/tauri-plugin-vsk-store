@@ -1,0 +1,29 @@
+[package]
+name = "tauri-plugin-vsk-store"
+version = "0.1.0"
+authors = ["Joaquin (Pato) Decima <jdecima@vasak.net.ar>", "Vasak Group"]
+description = "Client for the VasakOS system store (vasak-accounts-sync): verified owner, sync status and change notices for Tauri applications"
+edition = "2021"
+rust-version = "1.80.0"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-vsk-store"
+repository = "https://github.com/Vasak-OS/tauri-plugin-vsk-store/"
+license-file = "LICENSE"
+readme = "README.md"
+
+[dependencies]
+tauri = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# El bus de sesión, donde vive el almacén.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# El `StreamExt` de los avisos: zbus 5 ya no lo reexporta.
+futures-util = "0.3"
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

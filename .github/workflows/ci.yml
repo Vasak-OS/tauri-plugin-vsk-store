@@ -1,0 +1,63 @@
+# Los chequeos viven en el repositorio `.github` de la organización, así que
+# acá sólo se los llama. Cambiarlos es cambiarlos en un solo lugar.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    # Sólo lectura. Estos chequeos clonan, instalan dependencias y comprueban:
+    # no comentan, no etiquetan, no publican.
+    #
+    # El workflow llamado declara lo mismo en su trabajo, que es donde el
+    # permiso se aplica; esto lo escribe también acá porque el análisis
+    # estático de este repositorio no puede ver el otro archivo, y ahí un
+    # trabajo sin `permissions` se lee como permisos por omisión.
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/app.yml@main
+    with:
+      # Las pruebas de Rust del plugin. Un crate que no figura acá no corre sus
+      # pruebas en el CI y figura cubierto cero (sección 5 de las reglas).
+      #
+      # La lista de paquetes es la de este grafo, no la de Tauri: son los
+      # `Depends` de `libwebkit2gtk-4.1-dev` más el compilador de C, que necesitan
+      # los crates que traen código en C. Que un `.pc` falte no se ve como un
+      # `.pc` que falta: los `build.rs` de los crates `-sys` llaman a
+      # `process::exit(1)`, así que se lee como un crate que no compila, a mitad
+      # del grafo y muy lejos de la causa.
+      #
+      # `dbus-daemon` no es del grafo sino de las pruebas: `tests/bus.rs`
+      # levanta un bus privado por prueba para probar el cliente y la escucha
+      # contra un bus de verdad.
+      pruebas_rust: -p tauri-plugin-vsk-store
+      paquetes_rust: libwebkit2gtk-4.1-dev build-essential dbus-daemon
+    # Sólo el token de SonarQube Cloud, y por nombre: `secrets: inherit`
+    # le daría también el de crates.io y el de npm a un trabajo que
+    # instala dependencias de terceros.
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # La publicación, también compartida. Va después de los chequeos y sólo en
+  # `main`: publicar algo que no pasó las comprobaciones es peor que no
+  # publicar, y de crates.io no se puede borrar una versión, sólo retirarla.
+  #
+  # No hace falta acordarse de nada: el flujo mira si la versión del manifiesto
+  # está en el registro y sube sólo si falta. Un push que no toca la versión no
+  # hace nada.
+  publicar:
+    needs: app
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    uses: Vasak-OS/.github/.github/workflows/publicar-plugin.yml@main
+    # Los dos secretos por nombre y no `inherit`: `inherit` le entrega al flujo
+    # llamado todo lo que este repositorio tenga, y lo que necesita para
+    # publicar son estos dos. Si mañana el compartido cambia, lo que puede ver
+    # sigue siendo esto.
+    secrets:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

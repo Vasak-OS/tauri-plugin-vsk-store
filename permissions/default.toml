@@ -1,0 +1,7 @@
+[default]
+description = """
+Deja que la interfaz le pida al sincronizador una vuelta de unas cuentas y lea
+el estado de la sincronización del área de la aplicación. Lo que se lee del
+almacén lo sigue decidiendo el permiso store.<área> de vasak-permissions.
+"""
+permissions = ["allow-request-sync", "allow-sync-status"]
