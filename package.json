@@ -1,6 +1,6 @@
 {
   "name": "@vasakgroup/plugin-vsk-store",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Joaquin (Pato) Decima <joaquin.decima@vasak.net.ar>",
   "description": "Client for the VasakOS system store: verified owner, sync status and change notices (Created for VasakOS)",
   "type": "module",
