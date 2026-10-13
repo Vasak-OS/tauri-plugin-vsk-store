@@ -6,9 +6,10 @@
 //! sin esperar a la red. Este plugin es **el** cliente de ese almacén:
 //!
 //! - **Comprueba quién tiene el nombre del sincronizador** antes de creerle
-//!   nada: el ejecutable del dueño tiene que ser el instalado por el sistema
-//!   (vasak-accounts#77). Las llamadas y las señales van al dueño comprobado
-//!   por su nombre único.
+//!   nada: el dueño tiene que ejecutar el sincronizador instalado, en los
+//!   mismos espacios de nombres que la aplicación. Las llamadas y las señales
+//!   van al dueño comprobado por su nombre único. Es una primera capa, no el
+//!   cierre de vasak-accounts#77: ver [`owner`].
 //! - Le pide al sincronizador una vuelta (`RequestSync`) y dice a qué cuentas
 //!   no se les pudo pedir y por qué.
 //! - Lee el estado de la sincronización de un área (`GetStatus`).
@@ -64,7 +65,7 @@ pub fn init<R: Runtime>(areas: &[&'static str]) -> TauriPlugin<R> {
             commands::sync_status,
         ])
         .setup(move |app, _api| {
-            app.manage(Arc::new(StoreClient::new()));
+            app.manage(Arc::new(StoreClient::for_areas(watched.clone())));
             watch::watch(app.clone(), watched.clone());
             Ok(())
         })

@@ -16,11 +16,17 @@ red. Este plugin es la única forma en que lo hacen.
   El bus de sesión deja que cualquier proceso tome un nombre libre: si el
   sincronizador no arrancó o se está reiniciando, otro programa de la sesión
   podría hacerse pasar por él y mostrar correo, eventos o contactos inventados
-  bajo la cuenta real de la persona (vasak-accounts#77). El plugin mira el
-  ejecutable del dueño del nombre —tiene que ser `/usr/bin/vasak-accounts-sync`,
-  que sólo root puede escribir— y desde ahí habla **sólo con ese dueño**, por
-  su nombre único: llamadas y señales. Si el nombre cambia de dueño, vuelve a
+  bajo la cuenta real de la persona (vasak-accounts#77). El plugin exige que el
+  dueño del nombre ejecute **el mismo archivo** que
+  `/usr/bin/vasak-accounts-sync`, en los mismos espacios de nombres que la
+  aplicación y sin variables del cargador, y desde ahí habla **sólo con ese
+  dueño**, por su nombre único. Si el nombre cambia de dueño, vuelve a
   comprobar.
+
+  **Es una primera capa, no un límite completo**: un programa del mismo
+  usuario todavía puede pasarla por otros caminos. Cerrarlo pide que el bus
+  mismo decida quién puede tomar el nombre (AppArmor mediando D-Bus); eso se
+  sigue en vasak-accounts#77.
 - **«Actualizar»**: le pide al sincronizador una vuelta (`RequestSync`) y dice a
   qué cuentas no se les pudo pedir y por qué: sin permiso, se pidió hace un
   momento, el servicio no está.

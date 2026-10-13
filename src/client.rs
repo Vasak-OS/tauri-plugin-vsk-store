@@ -1,7 +1,7 @@
 //! El cliente del almacén, con el dueño del nombre comprobado.
 //!
 //! Cada conexión se comprueba una vez: quién tiene el nombre del sincronizador
-//! y si su ejecutable es el instalado (ver [`crate::owner`]). Desde ahí las
+//! y si es el instalado, con los límites que explica [`crate::owner`]. Desde ahí las
 //! llamadas van al **nombre único** de ese dueño y no al nombre conocido: si
 //! otro programa toma el nombre después de la comprobación, las llamadas no le
 //! llegan, fallan, y la próxima vuelve a comprobar.
@@ -33,12 +33,29 @@ pub trait OwnerCheck: Send + Sync + 'static {
     fn trusted(&self, pid: u32) -> bool;
 }
 
-/// El de verdad: el ejecutable del proceso tiene que ser el instalado.
+/// El de verdad: el proceso tiene que ejecutar el sincronizador instalado, en
+/// los mismos espacios de nombres que esta aplicación y sin variables del
+/// cargador. Ver [`crate::owner`] para lo que esto cubre y lo que no.
 pub struct InstalledExecutable;
 
 impl OwnerCheck for InstalledExecutable {
     fn trusted(&self, pid: u32) -> bool {
-        owner::executable_of(pid).is_some_and(|exe| owner::is_trusted_executable(&exe))
+        let Some(expected) = owner::expected() else {
+            eprintln!(
+                "[vsk-store] el sincronizador no está instalado en {}",
+                owner::INSTALLED_EXECUTABLE
+            );
+            return false;
+        };
+        match owner::judge(&owner::facts_of(pid), &expected) {
+            Ok(()) => true,
+            Err(rejection) => {
+                eprintln!(
+                    "[vsk-store] el nombre del sincronizador lo tiene el proceso {pid}, que no se acepta: {rejection:?}"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -55,7 +72,14 @@ pub struct Verified {
 pub struct StoreClient {
     cache: Mutex<Option<Verified>>,
     check: Arc<dyn OwnerCheck>,
+    /// Las áreas que registró la aplicación: las únicas cuyo estado puede pedir
+    /// la ventana.
+    watched: Vec<&'static str>,
 }
+
+/// Cuántas cuentas se aceptan en un pedido de «Actualizar», como mucho. Nadie
+/// tiene tantas; un pedido con más no salió de la ventana.
+pub const MAX_ACCOUNTS: usize = 64;
 
 impl Default for StoreClient {
     fn default() -> Self {
@@ -68,12 +92,26 @@ impl StoreClient {
         Self::with_check(Arc::new(InstalledExecutable))
     }
 
+    /// Con las áreas que registró la aplicación.
+    pub fn for_areas(watched: Vec<&'static str>) -> Self {
+        Self {
+            watched,
+            ..Self::new()
+        }
+    }
+
     /// Con otra comprobación del dueño. Para pruebas.
     pub fn with_check(check: Arc<dyn OwnerCheck>) -> Self {
         Self {
             cache: Mutex::new(None),
             check,
+            watched: status::AREAS.to_vec(),
         }
+    }
+
+    /// Las áreas que registró la aplicación.
+    pub fn watched(&self) -> &[&'static str] {
+        &self.watched
     }
 
     /// La conexión comprobada, abriéndola si no la hay.
@@ -107,10 +145,7 @@ impl StoreClient {
         if !self.check.trusted(pid) {
             return Err(Error::Impostor);
         }
-        Ok(Verified {
-            connection,
-            owner,
-        })
+        Ok(Verified { connection, owner })
     }
 
     /// Olvida la conexión comprobada: la próxima llamada vuelve a comprobar.
@@ -175,10 +210,10 @@ impl StoreClient {
     /// se les pudo pedir, y por qué; un fallo de una no frena a las demás.
     pub async fn request_sync(&self, account_ids: &[String]) -> Vec<SyncRequestFailure> {
         let mut failures = Vec::new();
-        for id in account_ids {
-            if let Err(error) = self.call::<_, ()>("RequestSync", &(id.as_str(),)).await {
+        for id in distinct_accounts(account_ids) {
+            if let Err(error) = self.call::<_, ()>("RequestSync", &(id,)).await {
                 failures.push(SyncRequestFailure {
-                    account_id: id.clone(),
+                    account_id: id.to_string(),
                     reason: error.reason(),
                 });
             }
@@ -196,6 +231,21 @@ impl StoreClient {
         let json = self.call_json("GetStatus", &()).await?;
         status::statuses_from(&json, area).map_err(Error::Reply)
     }
+}
+
+/// Las cuentas de un pedido, sin repetir y con tope: un pedido con más de
+/// [`MAX_ACCOUNTS`] se corta ahí.
+pub fn distinct_accounts(account_ids: &[String]) -> Vec<&str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for id in account_ids {
+        if seen.len() == MAX_ACCOUNTS {
+            break;
+        }
+        if !seen.contains(&id.as_str()) {
+            seen.push(id);
+        }
+    }
+    seen
 }
 
 /// Si un error dice que el dueño comprobado ya no está en el bus.
