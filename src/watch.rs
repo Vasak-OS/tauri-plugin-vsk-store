@@ -134,23 +134,31 @@ pub async fn listen(verified: &Verified, watched: &[&str], mut emit: impl FnMut(
         let Some(first) = first else {
             continue;
         };
-        if first == Notice::OwnerChanged {
-            return;
-        }
         let mut burst = Burst::default();
+        // Si el nombre cambió de dueño, no se espera a juntar más: lo que ya
+        // estaba en cola llegó del dueño comprobado y se pasa igual, y después
+        // se vuelve para comprobar al nuevo.
+        let mut owner_changed = first == Notice::OwnerChanged;
         burst.add(first, watched);
-        tokio::time::sleep(SETTLE).await;
+        if !owner_changed {
+            tokio::time::sleep(SETTLE).await;
+        }
+        // **Se vacía la cola entera aunque aparezca el cambio de dueño**: las
+        // tres fuentes se leen en el orden que elige `select_all`, así que el
+        // aviso del bus puede salir antes que un `Changed` que llegó primero.
         while let Some(Some(next)) = futures_util::FutureExt::now_or_never(notices.next()) {
             match next {
-                Some(Notice::OwnerChanged) => {
-                    emit(burst);
-                    return;
-                }
+                Some(Notice::OwnerChanged) => owner_changed = true,
                 Some(notice) => burst.add(notice, watched),
                 None => {}
             }
         }
-        emit(burst);
+        if burst != Burst::default() {
+            emit(burst);
+        }
+        if owner_changed {
+            return;
+        }
     }
 }
 

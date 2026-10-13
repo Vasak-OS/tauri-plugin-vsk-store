@@ -223,10 +223,12 @@ impl StoreClient {
 
     /// El estado de la sincronización de un área de cada cuenta.
     pub async fn sync_status(&self, area: &str) -> Result<Vec<AccountSyncStatus>> {
-        if !status::is_area(area) {
-            return Err(Error::Invalid(format!(
-                "«{area}» no es un área del almacén"
-            )));
+        // Sólo las áreas que registró la aplicación: la ventana no puede pedir
+        // el estado de las de otra.
+        if !self.watched.contains(&area) {
+            return Err(Error::Invalid(
+                "esa área no es de esta aplicación".to_string(),
+            ));
         }
         let json = self.call_json("GetStatus", &()).await?;
         status::statuses_from(&json, area).map_err(Error::Reply)

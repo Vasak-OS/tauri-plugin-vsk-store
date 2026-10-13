@@ -455,7 +455,6 @@ async fn actualizar_sin_sincronizador_dice_no_disponible() {
 }
 
 #[tokio::test]
-#[ignore = "bug: `sync_status` mira `is_area` y no `watched`; quitar al arreglarlo"]
 async fn el_estado_de_un_area_que_la_aplicacion_no_registro_no_se_pide() {
     let _lock = LOCK.lock().await;
     let bus = PrivateBus::start();
@@ -666,7 +665,6 @@ async fn cuando_el_dueno_se_cae_se_deja_de_escuchar() {
 }
 
 #[tokio::test]
-#[ignore = "bug: `listen` corta la ráfaga en `OwnerChanged` y pierde los `Changed` ya recibidos; quitar al arreglarlo"]
 async fn los_avisos_que_llegaron_antes_del_cambio_de_dueno_no_se_pierden() {
     let _lock = LOCK.lock().await;
     let bus = PrivateBus::start();
