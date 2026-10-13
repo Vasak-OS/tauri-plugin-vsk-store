@@ -166,16 +166,41 @@ impl StoreClient {
         B: Serialize + DynamicType,
         R: DeserializeOwned + zbus::zvariant::Type,
     {
-        match self.call_once(method, body).await {
+        self.call_on(PATH, INTERFACE, method, body).await
+    }
+
+    /// Llama a un método de **otro objeto del mismo sincronizador** —por
+    /// ejemplo la interfaz en vivo del correo, `ar.net.vasak.os.AccountsSync`
+    /// en `/ar/net/vasak/os/AccountsSync`—, con la misma comprobación del dueño
+    /// que el almacén. Mandar un correo a un impostor sería peor que leerle
+    /// datos inventados: todo lo que vaya a ese nombre pasa por acá.
+    pub async fn call_on<B, R>(
+        &self,
+        path: &str,
+        interface: &str,
+        method: &str,
+        body: &B,
+    ) -> Result<R>
+    where
+        B: Serialize + DynamicType,
+        R: DeserializeOwned + zbus::zvariant::Type,
+    {
+        match self.call_once(path, interface, method, body).await {
             Err(error) if owner_gone(&error) => {
                 self.forget().await;
-                self.call_once(method, body).await
+                self.call_once(path, interface, method, body).await
             }
             other => other,
         }
     }
 
-    async fn call_once<B, R>(&self, method: &str, body: &B) -> Result<R>
+    async fn call_once<B, R>(
+        &self,
+        path: &str,
+        interface: &str,
+        method: &str,
+        body: &B,
+    ) -> Result<R>
     where
         B: Serialize + DynamicType,
         R: DeserializeOwned + zbus::zvariant::Type,
@@ -185,8 +210,8 @@ impl StoreClient {
             .connection
             .call_method(
                 Some(verified.owner.as_ref()),
-                PATH,
-                Some(INTERFACE),
+                path,
+                Some(interface),
                 method,
                 body,
             )
