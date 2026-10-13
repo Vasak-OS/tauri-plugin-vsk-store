@@ -362,21 +362,51 @@ mod tests {
         assert_eq!(facts.executable, Some((exe.dev(), exe.ino())));
         assert_eq!(facts.mount_ns, Some(id_of("/proc/self/ns/mnt")));
         assert_eq!(facts.user_ns, Some(id_of("/proc/self/ns/user")));
-        // `/proc/<pid>/environ` es el entorno con el que arrancó; nadie lo toca
-        // en este binario de pruebas.
-        let mut expected_names: Vec<String> = std::env::vars_os()
-            .map(|(k, _)| k.to_string_lossy().into_owned())
-            .collect();
+    }
+
+    /// El entorno se lee del proceso, de `/proc/<pid>/environ`: el de **otro**
+    /// proceso con un entorno conocido, porque el de éste no sirve para
+    /// comparar —`/proc/self/environ` es el entorno con el que arrancó, y la
+    /// instrumentación de la cobertura le agrega variables después—.
+    #[test]
+    fn el_entorno_se_lee_del_proceso_tal_como_arranco() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env_clear()
+            .env("A", "1")
+            .env("LD_PRELOAD", "/tmp/no-existe.so")
+            .spawn()
+            .expect("se pudo lanzar sleep");
+        // Hasta que el hijo hizo `exec`, su `/proc` todavía es el de este
+        // proceso: se espera a que el ejecutable sea otro.
+        let mine = std::fs::read_link("/proc/self/exe").unwrap();
+        let mut facts = facts_of(child.id());
+        for _ in 0..100 {
+            if std::fs::read_link(format!("/proc/{}/exe", child.id()))
+                .ok()
+                .as_ref()
+                != Some(&mine)
+            {
+                facts = facts_of(child.id());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
         let mut names = facts.environment.clone();
-        expected_names.sort();
         names.sort();
-        // Sin volcar la lista: si algún día se colaran los valores, un fallo
-        // los imprimiría en el registro del CI.
-        assert!(
-            names == expected_names,
-            "los nombres leídos de /proc no son los del entorno ({} contra {})",
-            names.len(),
-            expected_names.len()
+        assert_eq!(names, vec!["A".to_string(), "LD_PRELOAD".to_string()]);
+        assert_eq!(
+            judge(
+                &facts,
+                &Expected {
+                    executable: facts.executable.unwrap(),
+                    mount_ns: facts.mount_ns.unwrap(),
+                    user_ns: facts.user_ns.unwrap(),
+                }
+            ),
+            Err(Rejection::LoaderVariables)
         );
     }
 
