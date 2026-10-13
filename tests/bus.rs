@@ -172,6 +172,66 @@ async fn serve(bus: &PrivateBus, store: &FakeStore) -> Connection {
         .unwrap()
 }
 
+/// Dónde publica el sincronizador su interfaz en vivo (la del correo).
+const SYNC_PATH: &str = "/ar/net/vasak/os/AccountsSync";
+/// La interfaz en vivo del sincronizador.
+const SYNC_INTERFACE: &str = "ar.net.vasak.os.AccountsSync";
+
+/// La interfaz en vivo de mentira: el otro objeto del mismo dueño. Anota qué
+/// le pidieron y contesta con su etiqueta.
+#[derive(Clone)]
+struct FakeSync {
+    label: &'static str,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeSync {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            calls: Arc::default(),
+        }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[zbus::interface(name = "ar.net.vasak.os.AccountsSync")]
+impl FakeSync {
+    async fn send_mail(&self, account_id: String, message: String) -> String {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("SendMail {account_id} {message}"));
+        self.label.to_string()
+    }
+}
+
+/// Publica el almacén y la interfaz en vivo en la misma conexión, con el
+/// nombre del sincronizador: como lo hace el de verdad.
+async fn serve_both(bus: &PrivateBus, store: &FakeStore, sync: &FakeSync) -> Connection {
+    zbus::connection::Builder::address(bus.address.as_str())
+        .unwrap()
+        .serve_at(PATH, store.clone())
+        .unwrap()
+        .serve_at(SYNC_PATH, sync.clone())
+        .unwrap()
+        .name(SERVICE)
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+}
+
+/// Manda un correo por la interfaz en vivo, con `call_on`.
+async fn send_mail(client: &StoreClient, account_id: &str) -> Result<String, Error> {
+    client
+        .call_on(SYNC_PATH, SYNC_INTERFACE, "SendMail", &(account_id, "hola"))
+        .await
+}
+
 /// Una comprobación del dueño que anota a quién le preguntaron.
 struct Recording {
     trust: AtomicBool,
@@ -522,6 +582,131 @@ async fn el_nombre_de_un_error_de_dbus_de_verdad_se_conserva() {
         status::error_name(&error).as_deref(),
         Some("org.freedesktop.DBus.Error.NameHasNoOwner")
     );
+}
+
+// --- Otro objeto del mismo dueño (`call_on`) ---------------------------------
+
+#[tokio::test]
+async fn call_on_llega_al_otro_objeto_del_dueno_comprobado_y_no_al_almacen() {
+    let _lock = LOCK.lock().await;
+    let bus = PrivateBus::start();
+    bus.as_session();
+    let store = FakeStore::new("almacen");
+    let sync = FakeSync::new("vivo");
+    let _conn = serve_both(&bus, &store, &sync).await;
+
+    let check = Recording::new(true);
+    let client = StoreClient::with_check(check.clone());
+    assert_eq!(send_mail(&client, "a").await.unwrap(), "vivo");
+    assert_eq!(sync.calls(), vec!["SendMail a hola"]);
+    assert!(store.calls().is_empty(), "{:?}", store.calls());
+    // Se comprobó el dueño antes de mandar nada.
+    assert_eq!(check.pids(), vec![std::process::id()]);
+
+    // Y el almacén se alcanza igual por `call_on`, con su ruta y su interfaz.
+    let json: String = client
+        .call_on(PATH, INTERFACE, "GetStatus", &())
+        .await
+        .unwrap();
+    assert!(json.contains("almacen"), "{json}");
+    assert_eq!(store.calls(), vec!["GetStatus"]);
+    assert_eq!(sync.calls(), vec!["SendMail a hola"]);
+    // Las dos llamadas usaron la misma comprobación.
+    assert_eq!(check.pids().len(), 1);
+}
+
+#[tokio::test]
+async fn call_on_con_un_impostor_no_manda_el_correo() {
+    let _lock = LOCK.lock().await;
+    let bus = PrivateBus::start();
+    bus.as_session();
+    let store = FakeStore::new("impostor");
+    let sync = FakeSync::new("impostor");
+    let _conn = serve_both(&bus, &store, &sync).await;
+
+    let check = Recording::new(false);
+    let client = StoreClient::with_check(check.clone());
+    let result = send_mail(&client, "a").await;
+    assert!(matches!(result, Err(Error::Impostor)), "{result:?}");
+    assert_eq!(check.pids(), vec![std::process::id()]);
+    assert!(sync.calls().is_empty(), "{:?}", sync.calls());
+    assert!(store.calls().is_empty(), "{:?}", store.calls());
+}
+
+#[tokio::test]
+async fn call_on_va_al_dueno_comprobado_aunque_otro_tome_el_nombre() {
+    let _lock = LOCK.lock().await;
+    let bus = PrivateBus::start();
+    bus.as_session();
+    let original_store = FakeStore::new("original");
+    let original = FakeSync::new("original");
+    let original_conn = serve_both(&bus, &original_store, &original).await;
+
+    let check = Recording::new(true);
+    let client = StoreClient::with_check(check.clone());
+    assert_eq!(send_mail(&client, "a").await.unwrap(), "original");
+
+    // Otro programa toma el nombre mientras el comprobado sigue en el bus.
+    original_conn.release_name(SERVICE).await.unwrap();
+    let impostor_store = FakeStore::new("impostor");
+    let impostor = FakeSync::new("impostor");
+    let _impostor_conn = serve_both(&bus, &impostor_store, &impostor).await;
+
+    assert_eq!(send_mail(&client, "b").await.unwrap(), "original");
+    assert_eq!(original.calls(), vec!["SendMail a hola", "SendMail b hola"]);
+    assert!(impostor.calls().is_empty(), "{:?}", impostor.calls());
+    // No hizo falta volver a comprobar: el dueño comprobado seguía ahí.
+    assert_eq!(check.pids().len(), 1);
+}
+
+#[tokio::test]
+async fn call_on_vuelve_a_comprobar_y_reintenta_si_el_dueno_se_reinicia() {
+    let _lock = LOCK.lock().await;
+    let bus = PrivateBus::start();
+    bus.as_session();
+    let observer = bus.connect().await;
+    let first = FakeSync::new("primero");
+    let first_conn = serve_both(&bus, &FakeStore::new("primero"), &first).await;
+
+    let check = Recording::new(true);
+    let client = StoreClient::with_check(check.clone());
+    assert_eq!(send_mail(&client, "a").await.unwrap(), "primero");
+
+    let first_unique = first_conn.unique_name().unwrap().to_string();
+    first_conn.close().await.unwrap();
+    gone(&observer, &first_unique).await;
+    let second = FakeSync::new("segundo");
+    let _second_conn = serve_both(&bus, &FakeStore::new("segundo"), &second).await;
+
+    assert_eq!(send_mail(&client, "b").await.unwrap(), "segundo");
+    assert_eq!(first.calls(), vec!["SendMail a hola"]);
+    assert_eq!(second.calls(), vec!["SendMail b hola"]);
+    // Se comprobó dos veces: al primero y al que lo reemplazó.
+    assert_eq!(check.pids().len(), 2);
+}
+
+#[tokio::test]
+async fn call_on_no_le_manda_nada_al_que_vuelve_si_no_es_de_confianza() {
+    let _lock = LOCK.lock().await;
+    let bus = PrivateBus::start();
+    bus.as_session();
+    let observer = bus.connect().await;
+    let first_conn = serve_both(&bus, &FakeStore::new("primero"), &FakeSync::new("primero")).await;
+
+    let check = Recording::new(true);
+    let client = StoreClient::with_check(check.clone());
+    send_mail(&client, "a").await.unwrap();
+
+    let first_unique = first_conn.unique_name().unwrap().to_string();
+    first_conn.close().await.unwrap();
+    gone(&observer, &first_unique).await;
+    check.trust.store(false, Ordering::SeqCst);
+    let impostor = FakeSync::new("impostor");
+    let _impostor_conn = serve_both(&bus, &FakeStore::new("impostor"), &impostor).await;
+
+    let result = send_mail(&client, "b").await;
+    assert!(matches!(result, Err(Error::Impostor)), "{result:?}");
+    assert!(impostor.calls().is_empty(), "{:?}", impostor.calls());
 }
 
 // --- Los avisos --------------------------------------------------------------
