@@ -12,11 +12,20 @@
 //! Que el proceso dueño del nombre:
 //!
 //! - ejecute **el mismo archivo** que `/usr/bin/vasak-accounts-sync` —mismo
-//!   dispositivo y mismo inodo, no sólo la misma ruta—;
-//! - viva en **los mismos espacios de nombres** de montaje y de usuario que
-//!   esta aplicación, para que no pueda haber montado otro programa encima de
-//!   esa ruta;
+//!   dispositivo y mismo inodo, no sólo la misma ruta—. Se lee por
+//!   `/proc/<pid>/exe`, que el kernel resuelve al archivo que de verdad se
+//!   ejecutó: la misma identidad aunque el proceso viva en otro espacio de
+//!   nombres de montaje;
+//! - viva en **el mismo espacio de nombres de usuario** que esta aplicación;
 //! - no tenga en su entorno variables del cargador (`LD_*`).
+//!
+//! **No se compara el espacio de nombres de montaje.** El sincronizador corre
+//! bajo systemd con `PrivateTmp`/`PrivateDevices`, que le dan uno propio: exigirlo
+//! igual al del escritorio rechazaría al servicio de verdad en toda máquina con el
+//! servicio endurecido. No hace falta — el inodo de `/proc/<pid>/exe` identifica el
+//! binario que se ejecutó sin depender de los montajes del proceso, así que un
+//! programa en otro espacio de montaje no puede hacerse pasar por el binario
+//! instalado sin ejecutarlo de verdad.
 //!
 //! **No es un límite de seguridad completo.** Un programa que corre como el
 //! mismo usuario puede arrancar el binario de verdad con código suyo adentro
@@ -41,8 +50,7 @@ pub type FileId = (u64, u64);
 pub struct ProcessFacts {
     /// El archivo que ejecuta (`/proc/<pid>/exe`, siguiendo el enlace).
     pub executable: Option<FileId>,
-    /// Sus espacios de nombres de montaje y de usuario.
-    pub mount_ns: Option<FileId>,
+    /// Su espacio de nombres de usuario.
     pub user_ns: Option<FileId>,
     /// Los nombres de las variables de su entorno.
     pub environment: Vec<String>,
@@ -53,7 +61,6 @@ pub struct ProcessFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
     pub executable: FileId,
-    pub mount_ns: FileId,
     pub user_ns: FileId,
 }
 
@@ -67,8 +74,7 @@ pub enum Rejection {
     /// anterior del sincronizador que siguió corriendo después de una
     /// actualización del paquete—.
     OtherExecutable,
-    /// Vive en otro espacio de nombres: ahí la ruta del binario puede ser
-    /// cualquier cosa.
+    /// Vive en otro espacio de nombres de usuario.
     OtherNamespace,
     /// Su entorno le pide al cargador cargar algo más.
     LoaderVariables,
@@ -76,15 +82,13 @@ pub enum Rejection {
 
 /// Decide si un proceso es el sincronizador, con lo que se sabe de él.
 pub fn judge(facts: &ProcessFacts, expected: &Expected) -> Result<(), Rejection> {
-    let (Some(executable), Some(mount_ns), Some(user_ns)) =
-        (facts.executable, facts.mount_ns, facts.user_ns)
-    else {
+    let (Some(executable), Some(user_ns)) = (facts.executable, facts.user_ns) else {
         return Err(Rejection::Unreadable);
     };
     if executable != expected.executable {
         return Err(Rejection::OtherExecutable);
     }
-    if mount_ns != expected.mount_ns || user_ns != expected.user_ns {
+    if user_ns != expected.user_ns {
         return Err(Rejection::OtherNamespace);
     }
     if facts.environment.iter().any(|name| name.starts_with("LD_")) {
@@ -114,7 +118,6 @@ pub fn facts_of(pid: u32) -> ProcessFacts {
     let base = PathBuf::from(format!("/proc/{pid}"));
     ProcessFacts {
         executable: file_id(&base.join("exe")),
-        mount_ns: file_id(&base.join("ns/mnt")),
         user_ns: file_id(&base.join("ns/user")),
         environment: std::fs::read(base.join("environ"))
             .map(|bytes| environment_names(&bytes))
@@ -122,8 +125,8 @@ pub fn facts_of(pid: u32) -> ProcessFacts {
     }
 }
 
-/// Contra qué se compara: el sincronizador instalado, y los espacios de
-/// nombres de esta aplicación. `None` si el sincronizador no está instalado.
+/// Contra qué se compara: el sincronizador instalado, y el espacio de nombres
+/// de usuario de esta aplicación. `None` si el sincronizador no está instalado.
 pub fn expected() -> Option<Expected> {
     expected_at(Path::new(INSTALLED_EXECUTABLE))
 }
@@ -133,7 +136,6 @@ pub fn expected() -> Option<Expected> {
 pub fn expected_at(executable: &Path) -> Option<Expected> {
     Some(Expected {
         executable: file_id(executable)?,
-        mount_ns: file_id(Path::new("/proc/self/ns/mnt"))?,
         user_ns: file_id(Path::new("/proc/self/ns/user"))?,
     })
 }
@@ -143,13 +145,11 @@ mod tests {
     use super::*;
 
     const EXE: FileId = (1, 100);
-    const MNT: FileId = (2, 200);
     const USER: FileId = (3, 300);
 
     fn expected_ids() -> Expected {
         Expected {
             executable: EXE,
-            mount_ns: MNT,
             user_ns: USER,
         }
     }
@@ -157,7 +157,6 @@ mod tests {
     fn genuine() -> ProcessFacts {
         ProcessFacts {
             executable: Some(EXE),
-            mount_ns: Some(MNT),
             user_ns: Some(USER),
             environment: vec!["HOME".into(), "PATH".into(), "XDG_RUNTIME_DIR".into()],
         }
@@ -178,19 +177,11 @@ mod tests {
     }
 
     #[test]
-    fn sin_poder_leer_un_espacio_de_nombres_no_se_acepta() {
-        let sin_montaje = ProcessFacts {
-            mount_ns: None,
-            ..genuine()
-        };
+    fn sin_poder_leer_el_espacio_de_usuario_no_se_acepta() {
         let sin_usuario = ProcessFacts {
             user_ns: None,
             ..genuine()
         };
-        assert_eq!(
-            judge(&sin_montaje, &expected_ids()),
-            Err(Rejection::Unreadable)
-        );
         assert_eq!(
             judge(&sin_usuario, &expected_ids()),
             Err(Rejection::Unreadable)
@@ -217,16 +208,52 @@ mod tests {
         );
     }
 
+    /// Regresión: el sincronizador corre bajo systemd con `PrivateTmp` y
+    /// `PrivateDevices`, o sea en su propio espacio de montaje, y se lo
+    /// rechazaba siempre por eso. Un proceso real en otro espacio de montaje
+    /// (`unshare -Urm`) con el ejecutable y el usuario esperados se acepta.
+    /// Si el entorno no deja crear espacios de nombres, no hay qué probar.
     #[test]
-    fn otro_espacio_de_montaje_no_se_acepta() {
-        let facts = ProcessFacts {
-            mount_ns: Some((2, 999)),
-            ..genuine()
+    fn el_servicio_en_su_propio_espacio_de_montaje_se_acepta() {
+        let Ok(mut child) = std::process::Command::new("unshare")
+            .args(["-Urm", "sleep", "30"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .spawn()
+        else {
+            return;
         };
-        assert_eq!(
-            judge(&facts, &expected_ids()),
-            Err(Rejection::OtherNamespace)
-        );
+        let my_mount = file_id(Path::new("/proc/self/ns/mnt"));
+        let my_exe = std::fs::read_link("/proc/self/exe").unwrap();
+        // Hasta que `unshare` hizo `exec` de `sleep` el proceso comparte el
+        // montaje de éste: se espera a que cambie, o se da por no probable.
+        let mut facts = None;
+        let mut other_mount = false;
+        for _ in 0..200 {
+            let base = PathBuf::from(format!("/proc/{}", child.id()));
+            if file_id(&base.join("ns/mnt")).is_some_and(|m| Some(m) != my_mount)
+                && std::fs::read_link(base.join("exe")).is_ok_and(|e| e != my_exe)
+            {
+                facts = Some(facts_of(child.id()));
+                other_mount = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let verdict = facts.as_ref().map(|f| {
+            // Lo esperado se arma como en producción (desde esta aplicación);
+            // sólo el usuario se toma del hijo, que lo creó con `-U`.
+            let expected = Expected {
+                user_ns: f.user_ns.unwrap(),
+                ..expected_at(&PathBuf::from(format!("/proc/{}/exe", child.id()))).unwrap()
+            };
+            judge(f, &expected)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        if other_mount {
+            assert_eq!(verdict, Some(Ok(())));
+        }
     }
 
     #[test]
@@ -267,8 +294,7 @@ mod tests {
         // Un proceso que ya no está no tiene «otro ejecutable»: no se sabe.
         let facts = ProcessFacts {
             executable: Some((9, 9)),
-            mount_ns: None,
-            user_ns: Some((9, 9)),
+            user_ns: None,
             environment: vec!["LD_PRELOAD".into()],
         };
         assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
@@ -278,7 +304,6 @@ mod tests {
     fn el_ejecutable_se_dice_antes_que_el_espacio_y_el_entorno() {
         let facts = ProcessFacts {
             executable: Some((9, 9)),
-            mount_ns: Some((9, 9)),
             user_ns: Some((9, 9)),
             environment: vec!["LD_PRELOAD".into()],
         };
@@ -291,7 +316,7 @@ mod tests {
     #[test]
     fn el_espacio_se_dice_antes_que_el_entorno() {
         let facts = ProcessFacts {
-            mount_ns: Some((9, 9)),
+            user_ns: Some((9, 9)),
             environment: vec!["LD_PRELOAD".into()],
             ..genuine()
         };
@@ -360,7 +385,6 @@ mod tests {
         let facts = facts_of(std::process::id());
         let exe = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
         assert_eq!(facts.executable, Some((exe.dev(), exe.ino())));
-        assert_eq!(facts.mount_ns, Some(id_of("/proc/self/ns/mnt")));
         assert_eq!(facts.user_ns, Some(id_of("/proc/self/ns/user")));
     }
 
@@ -402,7 +426,6 @@ mod tests {
                 &facts,
                 &Expected {
                     executable: facts.executable.unwrap(),
-                    mount_ns: facts.mount_ns.unwrap(),
                     user_ns: facts.user_ns.unwrap(),
                 }
             ),
@@ -418,7 +441,6 @@ mod tests {
             facts,
             ProcessFacts {
                 executable: None,
-                mount_ns: None,
                 user_ns: None,
                 environment: vec![],
             }
@@ -441,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn lo_esperado_lleva_el_archivo_instalado_y_los_espacios_de_esta_aplicacion() {
+    fn lo_esperado_lleva_el_archivo_instalado_y_el_espacio_de_usuario_de_esta_aplicacion() {
         let exe = std::env::current_exe().unwrap();
         let expected = expected_at(&exe).unwrap();
         let m = std::fs::metadata(&exe).unwrap();
@@ -449,7 +471,6 @@ mod tests {
             expected,
             Expected {
                 executable: (m.dev(), m.ino()),
-                mount_ns: id_of("/proc/self/ns/mnt"),
                 user_ns: id_of("/proc/self/ns/user"),
             }
         );

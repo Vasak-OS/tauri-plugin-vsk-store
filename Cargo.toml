@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-vsk-store"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Joaquin (Pato) Decima <jdecima@vasak.net.ar>", "Vasak Group"]
 description = "Client for the VasakOS system store (vasak-accounts-sync): verified owner, sync status and change notices for Tauri applications"
 edition = "2021"
