@@ -33,9 +33,9 @@ pub trait OwnerCheck: Send + Sync + 'static {
     fn trusted(&self, pid: u32) -> bool;
 }
 
-/// El de verdad: el proceso tiene que ejecutar el sincronizador instalado, en
-/// los mismos espacios de nombres que esta aplicación y sin variables del
-/// cargador. Ver [`crate::owner`] para lo que esto cubre y lo que no.
+/// El de verdad: el proceso tiene que ejecutar el sincronizador instalado y sin
+/// variables del cargador. Ver [`crate::owner`] para lo que esto cubre y lo que
+/// no.
 pub struct InstalledExecutable;
 
 impl OwnerCheck for InstalledExecutable {

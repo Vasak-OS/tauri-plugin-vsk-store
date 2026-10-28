@@ -14,18 +14,21 @@
 //! - ejecute **el mismo archivo** que `/usr/bin/vasak-accounts-sync` —mismo
 //!   dispositivo y mismo inodo, no sólo la misma ruta—. Se lee por
 //!   `/proc/<pid>/exe`, que el kernel resuelve al archivo que de verdad se
-//!   ejecutó: la misma identidad aunque el proceso viva en otro espacio de
-//!   nombres de montaje;
-//! - viva en **el mismo espacio de nombres de usuario** que esta aplicación;
+//!   ejecutó: la misma identidad aunque el proceso viva en otros espacios de
+//!   nombres;
 //! - no tenga en su entorno variables del cargador (`LD_*`).
 //!
-//! **No se compara el espacio de nombres de montaje.** El sincronizador corre
-//! bajo systemd con `PrivateTmp`/`PrivateDevices`, que le dan uno propio: exigirlo
-//! igual al del escritorio rechazaría al servicio de verdad en toda máquina con el
-//! servicio endurecido. No hace falta — el inodo de `/proc/<pid>/exe` identifica el
-//! binario que se ejecutó sin depender de los montajes del proceso, así que un
-//! programa en otro espacio de montaje no puede hacerse pasar por el binario
-//! instalado sin ejecutarlo de verdad.
+//! **No se comparan los espacios de nombres de montaje ni de usuario.** El
+//! sincronizador corre bajo systemd con `PrivateTmp`/`PrivateDevices`, que le dan
+//! un espacio de montaje propio; y como es un servicio **del usuario**, montar eso
+//! obliga al gestor sin privilegios a ponerlo además en su propio espacio de
+//! nombres de usuario. Exigir cualquiera de los dos igual al del escritorio
+//! rechazaría al servicio de verdad en toda máquina con el servicio endurecido —ya
+//! pasó: el escritorio mostraba «falta el servicio de cuentas» con el servicio
+//! corriendo. No hace falta — el inodo de `/proc/<pid>/exe` identifica el binario
+//! que se ejecutó sin depender de los espacios de nombres del proceso, así que un
+//! programa en otros espacios no puede hacerse pasar por el binario instalado sin
+//! ejecutarlo de verdad.
 //!
 //! **No es un límite de seguridad completo.** Un programa que corre como el
 //! mismo usuario puede arrancar el binario de verdad con código suyo adentro
@@ -50,18 +53,14 @@ pub type FileId = (u64, u64);
 pub struct ProcessFacts {
     /// El archivo que ejecuta (`/proc/<pid>/exe`, siguiendo el enlace).
     pub executable: Option<FileId>,
-    /// Su espacio de nombres de usuario.
-    pub user_ns: Option<FileId>,
     /// Los nombres de las variables de su entorno.
     pub environment: Vec<String>,
 }
 
-/// Lo mismo, de esta aplicación y del sincronizador instalado: contra qué se
-/// compara.
+/// Lo mismo, del sincronizador instalado: contra qué se compara.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
     pub executable: FileId,
-    pub user_ns: FileId,
 }
 
 /// Por qué no se acepta un proceso.
@@ -74,22 +73,17 @@ pub enum Rejection {
     /// anterior del sincronizador que siguió corriendo después de una
     /// actualización del paquete—.
     OtherExecutable,
-    /// Vive en otro espacio de nombres de usuario.
-    OtherNamespace,
     /// Su entorno le pide al cargador cargar algo más.
     LoaderVariables,
 }
 
 /// Decide si un proceso es el sincronizador, con lo que se sabe de él.
 pub fn judge(facts: &ProcessFacts, expected: &Expected) -> Result<(), Rejection> {
-    let (Some(executable), Some(user_ns)) = (facts.executable, facts.user_ns) else {
+    let Some(executable) = facts.executable else {
         return Err(Rejection::Unreadable);
     };
     if executable != expected.executable {
         return Err(Rejection::OtherExecutable);
-    }
-    if user_ns != expected.user_ns {
-        return Err(Rejection::OtherNamespace);
     }
     if facts.environment.iter().any(|name| name.starts_with("LD_")) {
         return Err(Rejection::LoaderVariables);
@@ -118,15 +112,14 @@ pub fn facts_of(pid: u32) -> ProcessFacts {
     let base = PathBuf::from(format!("/proc/{pid}"));
     ProcessFacts {
         executable: file_id(&base.join("exe")),
-        user_ns: file_id(&base.join("ns/user")),
         environment: std::fs::read(base.join("environ"))
             .map(|bytes| environment_names(&bytes))
             .unwrap_or_default(),
     }
 }
 
-/// Contra qué se compara: el sincronizador instalado, y el espacio de nombres
-/// de usuario de esta aplicación. `None` si el sincronizador no está instalado.
+/// Contra qué se compara: el sincronizador instalado. `None` si el
+/// sincronizador no está instalado.
 pub fn expected() -> Option<Expected> {
     expected_at(Path::new(INSTALLED_EXECUTABLE))
 }
@@ -136,7 +129,6 @@ pub fn expected() -> Option<Expected> {
 pub fn expected_at(executable: &Path) -> Option<Expected> {
     Some(Expected {
         executable: file_id(executable)?,
-        user_ns: file_id(Path::new("/proc/self/ns/user"))?,
     })
 }
 
@@ -145,19 +137,14 @@ mod tests {
     use super::*;
 
     const EXE: FileId = (1, 100);
-    const USER: FileId = (3, 300);
 
     fn expected_ids() -> Expected {
-        Expected {
-            executable: EXE,
-            user_ns: USER,
-        }
+        Expected { executable: EXE }
     }
 
     fn genuine() -> ProcessFacts {
         ProcessFacts {
             executable: Some(EXE),
-            user_ns: Some(USER),
             environment: vec!["HOME".into(), "PATH".into(), "XDG_RUNTIME_DIR".into()],
         }
     }
@@ -167,6 +154,35 @@ mod tests {
         assert_eq!(judge(&genuine(), &expected_ids()), Ok(()));
     }
 
+    /// El contrato: el veredicto sólo depende del ejecutable y del cargador.
+    /// `ProcessFacts` ya no tiene dónde llevar un espacio de nombres, así que un
+    /// servicio de usuario endurecido (que systemd mete en su propio espacio de
+    /// usuario y de montaje) no puede ser rechazado por eso.
+    #[test]
+    fn el_veredicto_solo_depende_del_ejecutable_y_del_cargador() {
+        let ejecutable_ok = ProcessFacts {
+            executable: Some(EXE),
+            environment: vec![],
+        };
+        assert_eq!(judge(&ejecutable_ok, &expected_ids()), Ok(()));
+        let otro = ProcessFacts {
+            executable: Some((EXE.0, EXE.1 + 1)),
+            ..ejecutable_ok.clone()
+        };
+        assert_eq!(
+            judge(&otro, &expected_ids()),
+            Err(Rejection::OtherExecutable)
+        );
+        let cargador = ProcessFacts {
+            environment: vec!["LD_PRELOAD".into()],
+            ..ejecutable_ok
+        };
+        assert_eq!(
+            judge(&cargador, &expected_ids()),
+            Err(Rejection::LoaderVariables)
+        );
+    }
+
     #[test]
     fn sin_poder_leer_el_ejecutable_no_se_acepta() {
         let facts = ProcessFacts {
@@ -174,18 +190,6 @@ mod tests {
             ..genuine()
         };
         assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
-    }
-
-    #[test]
-    fn sin_poder_leer_el_espacio_de_usuario_no_se_acepta() {
-        let sin_usuario = ProcessFacts {
-            user_ns: None,
-            ..genuine()
-        };
-        assert_eq!(
-            judge(&sin_usuario, &expected_ids()),
-            Err(Rejection::Unreadable)
-        );
     }
 
     #[test]
@@ -218,8 +222,8 @@ mod tests {
         let pid = std::process::id();
         let facts = facts_of(pid);
         let expected = expected_at(Path::new(&format!("/proc/{pid}/exe")))
-            .expect("el ejecutable y el espacio de usuario propios son legibles");
-        assert!(facts.executable.is_some() && facts.user_ns.is_some());
+            .expect("el ejecutable propio es legible");
+        assert!(facts.executable.is_some());
         // Sin `LD_*` en el entorno del proceso de pruebas el veredicto es Ok; si
         // el entorno que corre las pruebas lo trae, es el rechazo esperado.
         let verdict = if facts.environment.iter().any(|n| n.starts_with("LD_")) {
@@ -228,18 +232,6 @@ mod tests {
             Ok(())
         };
         assert_eq!(judge(&facts, &expected), verdict);
-    }
-
-    #[test]
-    fn otro_espacio_de_usuario_no_se_acepta() {
-        let facts = ProcessFacts {
-            user_ns: Some((3, 999)),
-            ..genuine()
-        };
-        assert_eq!(
-            judge(&facts, &expected_ids()),
-            Err(Rejection::OtherNamespace)
-        );
     }
 
     #[test]
@@ -267,36 +259,21 @@ mod tests {
     fn lo_ilegible_se_dice_antes_que_lo_distinto() {
         // Un proceso que ya no está no tiene «otro ejecutable»: no se sabe.
         let facts = ProcessFacts {
-            executable: Some((9, 9)),
-            user_ns: None,
+            executable: None,
             environment: vec!["LD_PRELOAD".into()],
         };
         assert_eq!(judge(&facts, &expected_ids()), Err(Rejection::Unreadable));
     }
 
     #[test]
-    fn el_ejecutable_se_dice_antes_que_el_espacio_y_el_entorno() {
+    fn el_ejecutable_se_dice_antes_que_el_entorno() {
         let facts = ProcessFacts {
             executable: Some((9, 9)),
-            user_ns: Some((9, 9)),
             environment: vec!["LD_PRELOAD".into()],
         };
         assert_eq!(
             judge(&facts, &expected_ids()),
             Err(Rejection::OtherExecutable)
-        );
-    }
-
-    #[test]
-    fn el_espacio_se_dice_antes_que_el_entorno() {
-        let facts = ProcessFacts {
-            user_ns: Some((9, 9)),
-            environment: vec!["LD_PRELOAD".into()],
-            ..genuine()
-        };
-        assert_eq!(
-            judge(&facts, &expected_ids()),
-            Err(Rejection::OtherNamespace)
         );
     }
 
@@ -349,17 +326,11 @@ mod tests {
         );
     }
 
-    fn id_of(path: &str) -> FileId {
-        let m = std::fs::metadata(path).unwrap();
-        (m.dev(), m.ino())
-    }
-
     #[test]
     fn lo_que_se_lee_de_este_proceso_coincide_con_lo_que_es() {
         let facts = facts_of(std::process::id());
         let exe = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
         assert_eq!(facts.executable, Some((exe.dev(), exe.ino())));
-        assert_eq!(facts.user_ns, Some(id_of("/proc/self/ns/user")));
     }
 
     /// El entorno se lee del proceso, de `/proc/<pid>/environ`: el de **otro**
@@ -400,7 +371,6 @@ mod tests {
                 &facts,
                 &Expected {
                     executable: facts.executable.unwrap(),
-                    user_ns: facts.user_ns.unwrap(),
                 }
             ),
             Err(Rejection::LoaderVariables)
@@ -415,7 +385,6 @@ mod tests {
             facts,
             ProcessFacts {
                 executable: None,
-                user_ns: None,
                 environment: vec![],
             }
         );
@@ -437,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn lo_esperado_lleva_el_archivo_instalado_y_el_espacio_de_usuario_de_esta_aplicacion() {
+    fn lo_esperado_lleva_solo_el_archivo_instalado() {
         let exe = std::env::current_exe().unwrap();
         let expected = expected_at(&exe).unwrap();
         let m = std::fs::metadata(&exe).unwrap();
@@ -445,7 +414,6 @@ mod tests {
             expected,
             Expected {
                 executable: (m.dev(), m.ino()),
-                user_ns: id_of("/proc/self/ns/user"),
             }
         );
     }
