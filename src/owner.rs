@@ -208,52 +208,26 @@ mod tests {
         );
     }
 
-    /// Regresión: el sincronizador corre bajo systemd con `PrivateTmp` y
-    /// `PrivateDevices`, o sea en su propio espacio de montaje, y se lo
-    /// rechazaba siempre por eso. Un proceso real en otro espacio de montaje
-    /// (`unshare -Urm`) con el ejecutable y el usuario esperados se acepta.
-    /// Si el entorno no deja crear espacios de nombres, no hay qué probar.
+    /// Cubre el camino real de `/proc` (`facts_of` + `expected_at` + `judge`)
+    /// con el proceso actual, que siempre es legible y no pide crear espacios de
+    /// nombres. No se exige el mismo espacio de montaje: el sincronizador corre
+    /// bajo systemd con `PrivateTmp`/`PrivateDevices`, o sea en uno propio, y
+    /// `judge` ya no lo mira; la identidad sale del inodo de `/proc/<pid>/exe`.
     #[test]
-    fn el_servicio_en_su_propio_espacio_de_montaje_se_acepta() {
-        let Ok(mut child) = std::process::Command::new("unshare")
-            .args(["-Urm", "sleep", "30"])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .spawn()
-        else {
-            return;
+    fn el_camino_real_de_proc_acepta_al_proceso_con_su_propio_ejecutable() {
+        let pid = std::process::id();
+        let facts = facts_of(pid);
+        let expected = expected_at(Path::new(&format!("/proc/{pid}/exe")))
+            .expect("el ejecutable y el espacio de usuario propios son legibles");
+        assert!(facts.executable.is_some() && facts.user_ns.is_some());
+        // Sin `LD_*` en el entorno del proceso de pruebas el veredicto es Ok; si
+        // el entorno que corre las pruebas lo trae, es el rechazo esperado.
+        let verdict = if facts.environment.iter().any(|n| n.starts_with("LD_")) {
+            Err(Rejection::LoaderVariables)
+        } else {
+            Ok(())
         };
-        let my_mount = file_id(Path::new("/proc/self/ns/mnt"));
-        let my_exe = std::fs::read_link("/proc/self/exe").unwrap();
-        // Hasta que `unshare` hizo `exec` de `sleep` el proceso comparte el
-        // montaje de éste: se espera a que cambie, o se da por no probable.
-        let mut facts = None;
-        let mut other_mount = false;
-        for _ in 0..200 {
-            let base = PathBuf::from(format!("/proc/{}", child.id()));
-            if file_id(&base.join("ns/mnt")).is_some_and(|m| Some(m) != my_mount)
-                && std::fs::read_link(base.join("exe")).is_ok_and(|e| e != my_exe)
-            {
-                facts = Some(facts_of(child.id()));
-                other_mount = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let verdict = facts.as_ref().map(|f| {
-            // Lo esperado se arma como en producción (desde esta aplicación);
-            // sólo el usuario se toma del hijo, que lo creó con `-U`.
-            let expected = Expected {
-                user_ns: f.user_ns.unwrap(),
-                ..expected_at(&PathBuf::from(format!("/proc/{}/exe", child.id()))).unwrap()
-            };
-            judge(f, &expected)
-        });
-        let _ = child.kill();
-        let _ = child.wait();
-        if other_mount {
-            assert_eq!(verdict, Some(Ok(())));
-        }
+        assert_eq!(judge(&facts, &expected), verdict);
     }
 
     #[test]
